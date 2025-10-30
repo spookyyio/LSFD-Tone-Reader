@@ -80,6 +80,6 @@ Contributing
 - Fixes and improvements welcome. If you change the TTS backend, adjust worker COM initialization accordingly.
 
 License
-- MIT-style (add your license text here)
+- MIT
 
 Enjoy — let me know if you want a tailored `tonereader.spec` or a `requirements.txt` and I can add them to the repo and run a build for you.
