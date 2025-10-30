@@ -616,13 +616,15 @@ class ToneReaderApp:
         except Exception:
             pass
 
-        # Put into TTS queue
+        # Put into TTS queue together with an enqueue timestamp so the
+        # worker can delay speaking by ~2 seconds from the time the line
+        # was read. We put a tuple (text, ts) for robust timing.
         try:
-            self._tts_queue.put(clean_text, block=False)
+            self._tts_queue.put((clean_text, time.time()), block=False)
         except queue.Full:
             # Rare: queue full; try again with blocking briefly
             try:
-                self._tts_queue.put(clean_text, timeout=0.5)
+                self._tts_queue.put((clean_text, time.time()), timeout=0.5)
             except Exception as e:
                 self.status_text.set(f"TTS queue error: {e}")
         except Exception as e:
@@ -655,6 +657,27 @@ class ToneReaderApp:
                     if item is None:
                         break
 
+                    # Support older callers which might have enqueued a raw
+                    # string (defensive); normalize to (text, ts)
+                    if isinstance(item, str):
+                        text_item, ts = item, time.time()
+                    else:
+                        try:
+                            text_item, ts = item
+                        except Exception:
+                            # Unexpected shape — coerce to string and speak immediately
+                            text_item, ts = str(item), time.time()
+
+                    # Wait up to ~2 seconds from the enqueue time before speaking.
+                    # Use a short-sleep loop to allow prompt shutdown.
+                    speak_time = float(ts) + 2.0
+                    while (time.time() < speak_time) and (not self._tts_worker_stop.is_set()):
+                        time.sleep(0.05)
+
+                    # If stop requested, break early
+                    if self._tts_worker_stop.is_set():
+                        break
+
                     # Create a fresh engine, set volume, speak, then stop and discard.
                     eng = None
                     try:
@@ -665,7 +688,7 @@ class ToneReaderApp:
                             eng.setProperty('volume', self.current_volume.get())
                         except Exception:
                             pass
-                        eng.say(item)
+                        eng.say(text_item)
                         eng.runAndWait()
                         try:
                             eng.stop()
