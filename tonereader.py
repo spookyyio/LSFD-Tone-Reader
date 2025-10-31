@@ -10,6 +10,8 @@ import threading
 import queue
 import json
 import pyttsx3
+import utils
+import settings
 
 # Try to import pythoncom for proper COM initialization on Windows threads.
 # If it's missing we'll continue but the user should install pywin32 for best results.
@@ -20,9 +22,9 @@ except Exception:
     pythoncom = None
     _HAS_PYTHONCOM = False
 
-# config
-KEYWORD = "** STATION TONE"
-MARKER_RE = re.compile(r"\*\*\s*\[?STATION\s+TONE\]?", re.IGNORECASE)
+# config constants and helpers are in utils
+KEYWORD = utils.KEYWORD
+MARKER_RE = utils.MARKER_RE
 
 class ToneReaderApp:
     def __init__(self, root):
@@ -35,24 +37,32 @@ class ToneReaderApp:
         self.status_text = tk.StringVar()
         self.current_volume = tk.DoubleVar(value=1.0)
         self.watch_thread = None
+        self.watcher = None
         self.stop_event = threading.Event()
 
-        # TTS worker / queue
-        self._tts_queue = queue.Queue()
-        self._tts_worker_stop = threading.Event()
-        self._tts_worker = threading.Thread(target=self._tts_worker_loop, daemon=True)
-        # Exposed pointer to the worker's active engine object
-        # It will be set from inside the worker thread, main thread may read it but should handle None.
-        self.engine = None
-
-        # start da worker
-        self._tts_worker.start()
+        # TTS worker encapsulated in a separate module for readability.
+        try:
+            from ttswrapper import TTSWorker
+            self.tts = TTSWorker(self.current_volume.get)
+            self.tts.start()
+        except Exception:
+            # Fallback: if the module isn't available for any reason, expose
+            # minimal placeholders so the rest of the code can still function
+            # without crashing. This should not normally happen.
+            self.tts = None
 
         # track last seen chat_log (for .storage JSON files) so we only speak new lines
         self._last_chat_log = None
 
         self.create_widgets()
-        self.load_settings()
+        # Load last-used log from settings file (if any)
+        try:
+            last = settings.load_settings()
+            if last:
+                self.log_file_path.set(last)
+                self.status_text.set(f"Loaded last log: {last}")
+        except Exception:
+            pass
 
         self.status_text.set("Ready. Select a RAGEMP folder and press Start.")
         if not _HAS_PYTHONCOM:
@@ -203,7 +213,10 @@ class ToneReaderApp:
             if file_path:
                 self.log_file_path.set(file_path)
                 self.status_text.set("Log file selected. Ready to start.")
-                self.save_settings()
+                try:
+                    settings.save_settings(self.log_file_path.get())
+                except Exception:
+                    pass
                 return
 
         self.status_text.set("No log file selected. Please choose a RAGEMP folder with clientdata/console.txt.")
@@ -339,31 +352,23 @@ class ToneReaderApp:
             traceback.print_exc()
 
     def settings_path(self):
-        try:
-            base = os.path.dirname(os.path.abspath(__file__))
-        except Exception:
-            base = os.getcwd()
-        return os.path.join(base, 'tonereader_settings.json')
+        # Left for backward-compat; recommend using settings.get_settings_path()
+        return settings.get_settings_path()
 
     def load_settings(self):
-        path = self.settings_path()
+        # Deprecated: Use module-level settings.load_settings()
         try:
-            if os.path.exists(path):
-                with open(path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    last = data.get('last_log')
-                    if last and os.path.exists(last):
-                        self.log_file_path.set(last)
-                        self.status_text.set(f"Loaded last log: {last}")
+            last = settings.load_settings()
+            if last:
+                self.log_file_path.set(last)
+                self.status_text.set(f"Loaded last log: {last}")
         except Exception:
             pass
 
     def save_settings(self):
-        path = self.settings_path()
+        # Deprecated: Use settings.save_settings(last_log_path)
         try:
-            data = {'last_log': self.log_file_path.get()}
-            with open(path, 'w', encoding='utf-8') as f:
-                json.dump(data, f)
+            settings.save_settings(self.log_file_path.get())
         except Exception:
             pass
 
@@ -377,8 +382,12 @@ class ToneReaderApp:
             # If worker has a live engine pointer, attempt to update its property.
             # This may silently fail if engine is None or not accessible.
             try:
-                if self.engine is not None:
-                    self.engine.setProperty('volume', vol)
+                # If worker exposes a live engine, try to update its property.
+                if getattr(self, 'tts', None) is not None and getattr(self.tts, 'engine', None) is not None:
+                    try:
+                        self.tts.engine.setProperty('volume', vol)
+                    except Exception:
+                        pass
             except Exception:
                 # Not critical; main worker will set volume next utterance.
                 pass
@@ -401,8 +410,22 @@ class ToneReaderApp:
         self.browse_button.config(state="disabled")
         self.stop_event.clear()
 
-        self.watch_thread = threading.Thread(target=self.follow_file_thread, daemon=True)
-        self.watch_thread.start()
+        # Use Watcher class to follow the file in a background thread.
+        try:
+            from watcher import Watcher
+            # on_message will be called from watcher thread; schedule speak on main thread
+            def _on_message(msg):
+                try:
+                    self.root.after(0, self.speak, msg)
+                except Exception:
+                    pass
+
+            self.watcher = Watcher(log_path, _on_message, self.add_log_entry, MARKER_RE, stop_event=self.stop_event)
+            self.watcher.start()
+        except Exception:
+            # Fallback to legacy thread method if watcher import fails
+            self.watch_thread = threading.Thread(target=self.follow_file_thread, daemon=True)
+            self.watch_thread.start()
 
     def stop_watching(self, status_message=None):
         if status_message:
@@ -412,180 +435,42 @@ class ToneReaderApp:
         self.start_button.config(state="normal")
         self.stop_button.config(state="disabled")
         self.browse_button.config(state="normal")
+        # Stop the watcher thread if present
+        try:
+            if getattr(self, 'watcher', None) is not None:
+                try:
+                    self.watcher.stop()
+                except Exception:
+                    pass
+                self.watcher = None
+        except Exception:
+            pass
         self.stop_event.set()
 
     def follow_file_thread(self):
+        # Delegate to watcher implementation (short wrapper). The heavy
+        # follow-file logic was moved to watcher.py; this function acts as
+        # a safe fallback in case `start_watching` attempted to use it.
         log_path = self.log_file_path.get()
         try:
-            # Open file and monitor for truncation/replacement. Use bounded
-            # reads so we can log small previews for debugging.
-            file = open(log_path, 'rb')
+            from watcher import Watcher
+
+            # Use the Watcher._run() directly here because we're already
+            # running inside a dedicated thread when this fallback is used.
+            def _on_message(msg):
+                try:
+                    self.root.after(0, self.speak, msg)
+                except Exception:
+                    pass
+
+            w = Watcher(log_path, _on_message, self.add_log_entry, MARKER_RE, stop_event=self.stop_event)
+            # Run the watch loop in this thread (blocking) as a fallback.
+            w._run()
+        except Exception:
             try:
-                try:
-                    file.seek(0, os.SEEK_END)
-                except Exception:
-                    pass
-
-                try:
-                    self.add_log_entry(f"[INFO] Watching file: {log_path}")
-                except Exception:
-                    pass
-
-                # If this looks like a .storage JSON file, initialize our
-                # last-seen chat_log so we don't immediately speak history.
-                try:
-                    with open(log_path, 'r', encoding='utf-8') as jf:
-                        try:
-                            data = json.load(jf)
-                            chat = data.get('chat_log') if isinstance(data, dict) else None
-                            if isinstance(chat, str):
-                                self._last_chat_log = chat
-                                try:
-                                    self.add_log_entry(f"[DEBUG] Initialized chat_log length={len(chat)}")
-                                except Exception:
-                                    pass
-                        except Exception:
-                            # Not a JSON/.storage format or malformed; ignore
-                            pass
-                except Exception:
-                    pass
-
-                buffer = b''
-                try:
-                    last_stat = os.stat(log_path)
-                except Exception:
-                    last_stat = None
-
-                while not self.stop_event.is_set():
-                    # Detect rotation/truncation by checking file stat
-                    try:
-                        cur_stat = os.stat(log_path)
-                    except Exception:
-                        cur_stat = None
-
-                    try:
-                        cur_pos = None
-                        try:
-                            cur_pos = file.tell()
-                        except Exception:
-                            pass
-
-                        if cur_stat and last_stat and cur_pos is not None:
-                            if cur_stat.st_size < cur_pos:
-                                try:
-                                    self.add_log_entry("[DEBUG] File truncated; seeking to end")
-                                except Exception:
-                                    pass
-                                try:
-                                    file.seek(0, os.SEEK_END)
-                                except Exception:
-                                    pass
-
-                            if cur_stat.st_mtime != last_stat.st_mtime or getattr(cur_stat, 'st_ino', None) != getattr(last_stat, 'st_ino', None):
-                                # Reopen the file handle when replaced
-                                try:
-                                    file.close()
-                                except Exception:
-                                    pass
-                                try:
-                                    file = open(log_path, 'rb')
-                                    file.seek(0, os.SEEK_END)
-                                    try:
-                                        self.add_log_entry("[DEBUG] File replaced; reopened handle")
-                                    except Exception:
-                                        pass
-                                    # After reopening, try to parse .storage JSON and
-                                    # only speak newly-added chat lines (if any).
-                                    try:
-                                        with open(log_path, 'r', encoding='utf-8') as jf:
-                                            data = json.load(jf)
-                                            chat = data.get('chat_log') if isinstance(data, dict) else None
-                                            if isinstance(chat, str):
-                                                prev = self._last_chat_log or ''
-                                                if len(chat) > len(prev) and chat.startswith(prev):
-                                                    new_part = chat[len(prev):]
-                                                else:
-                                                    # If we can't align, take last portion
-                                                    new_part = chat
-                                                # Process new lines for marker
-                                                for L in new_part.split('\n'):
-                                                    m2 = MARKER_RE.search(L)
-                                                    if m2:
-                                                        try:
-                                                            self.add_log_entry(f"[READ] {L.strip()}")
-                                                        except Exception:
-                                                            pass
-                                                        extracted2 = L[m2.end():].strip()
-                                                        if extracted2:
-                                                            self.root.after(0, self.speak, extracted2)
-                                                self._last_chat_log = chat
-                                    except Exception:
-                                        pass
-                                except Exception:
-                                    time.sleep(0.5)
-                                    last_stat = cur_stat
-                                    time.sleep(0.1)
-                                    continue
-
-                        last_stat = cur_stat
-                    except Exception:
-                        pass
-
-                    # Read new data in small chunks
-                    try:
-                        chunk = file.read(4096)
-                    except Exception:
-                        chunk = b''
-
-                    if not chunk:
-                        time.sleep(0.5)
-                        continue
-
-                    # Debug: log read size + small preview to aid diagnosis
-                    try:
-                        preview = chunk.decode('utf-8', errors='ignore')[:200].replace('\n', ' ')
-                        self.add_log_entry(f"[DEBUG] Read {len(chunk)} bytes: {preview}")
-                    except Exception:
-                        pass
-
-                    buffer += chunk
-                    text = buffer.decode('utf-8', errors='ignore')
-
-                    if '\n' in text:
-                        parts = text.split('\n')
-                        for line in parts[:-1]:
-                            m = MARKER_RE.search(line)
-                            if m:
-                                try:
-                                    self.add_log_entry(f"[READ] {line.strip()}")
-                                except Exception:
-                                    pass
-                                extracted = line[m.end():].strip()
-                                if extracted:
-                                    self.root.after(0, self.speak, extracted)
-
-                        remainder = parts[-1]
-                        buffer = remainder.encode('utf-8', errors='ignore')
-                    else:
-                        m = MARKER_RE.search(text)
-                        if m:
-                            try:
-                                self.add_log_entry(f"[READ] {text.strip()}")
-                            except Exception:
-                                pass
-                            extracted = text[m.end():].strip()
-                            if extracted:
-                                self.root.after(0, self.speak, extracted)
-                            buffer = b''
-            finally:
-                try:
-                    file.close()
-                except Exception:
-                    pass
-        except FileNotFoundError:
-            self.root.after(0, self.handle_thread_error, "Error: Log file not found.")
-        except Exception as e:
-            self.root.after(0, self.handle_thread_error, f"Error: {e}")
+                self.add_log_entry("[ERROR] Fallback watcher failed to start; ensure watcher.py is present")
+            except Exception:
+                pass
 
     def handle_thread_error(self, message):
         self.stop_watching(status_message=message)
@@ -595,17 +480,8 @@ class ToneReaderApp:
         if self.stop_event.is_set():
             return
 
-        # If the incoming line still contains a marker, strip everything
-        # before and including the marker so we only speak user text.
-        m = MARKER_RE.search(text)
-        if m:
-            text = text[m.end():]
-
-        # Clean timestamps and any leftover marker text
-        clean_text = re.sub(r'\[\d{2}:\d{2}:\d{2}\]', '', text)
-        # Also remove the literal KEYWORD if present as a fallback
-        clean_text = clean_text.replace(KEYWORD, "")
-        clean_text = clean_text.strip()
+        # Use centralized cleaner (removes marker, timestamps, and keyword)
+        clean_text = utils.clean_text(text)
 
         if not clean_text:
             return
@@ -620,13 +496,21 @@ class ToneReaderApp:
         # worker can delay speaking by ~2 seconds from the time the line
         # was read. We put a tuple (text, ts) for robust timing.
         try:
-            self._tts_queue.put((clean_text, time.time()), block=False)
-        except queue.Full:
-            # Rare: queue full; try again with blocking briefly
-            try:
-                self._tts_queue.put((clean_text, time.time()), timeout=0.5)
-            except Exception as e:
-                self.status_text.set(f"TTS queue error: {e}")
+            if getattr(self, 'tts', None) is not None:
+                self.tts.enqueue(clean_text, time.time())
+            else:
+                # If TTS worker missing, attempt to use pyttsx3 directly as a best-effort.
+                try:
+                    eng = pyttsx3.init()
+                    eng.setProperty('volume', self.current_volume.get())
+                    eng.say(clean_text)
+                    eng.runAndWait()
+                    try:
+                        eng.stop()
+                    except Exception:
+                        pass
+                except Exception as e:
+                    self.status_text.set(f"TTS error: {e}")
         except Exception as e:
             self.status_text.set(f"TTS queue error: {e}")
 
@@ -638,100 +522,17 @@ class ToneReaderApp:
         """
         import traceback, time
 
-        # Initialize COM on this thread if available (Windows/pywin32).
-        if _HAS_PYTHONCOM:
-            try:
-                pythoncom.CoInitialize()
-            except Exception as e:
-                print(f"[WARN] pythoncom.CoInitialize() failed: {e}")
-
-        try:
-            while not self._tts_worker_stop.is_set():
-                try:
-                    try:
-                        item = self._tts_queue.get(timeout=0.4)
-                    except queue.Empty:
-                        continue
-
-                    # sentinel to stop immediately
-                    if item is None:
-                        break
-
-                    # Support older callers which might have enqueued a raw
-                    # string (defensive); normalize to (text, ts)
-                    if isinstance(item, str):
-                        text_item, ts = item, time.time()
-                    else:
-                        try:
-                            text_item, ts = item
-                        except Exception:
-                            # Unexpected shape — coerce to string and speak immediately
-                            text_item, ts = str(item), time.time()
-
-                    # Wait up to ~2 seconds from the enqueue time before speaking.
-                    # Use a short-sleep loop to allow prompt shutdown.
-                    speak_time = float(ts) + 2.0
-                    while (time.time() < speak_time) and (not self._tts_worker_stop.is_set()):
-                        time.sleep(0.05)
-
-                    # If stop requested, break early
-                    if self._tts_worker_stop.is_set():
-                        break
-
-                    # Create a fresh engine, set volume, speak, then stop and discard.
-                    eng = None
-                    try:
-                        eng = pyttsx3.init()
-                        # expose the engine pointer (main thread may attempt to set volume)
-                        self.engine = eng
-                        try:
-                            eng.setProperty('volume', self.current_volume.get())
-                        except Exception:
-                            pass
-                        eng.say(text_item)
-                        eng.runAndWait()
-                        try:
-                            eng.stop()
-                        except Exception:
-                            pass
-                    except Exception:
-                        traceback.print_exc()
-                        try:
-                            if eng:
-                                eng.stop()
-                        except Exception:
-                            pass
-                    finally:
-                        # Clear the engine pointer so main thread knows it's gone.
-                        self.engine = None
-                        # small pause to allow audio system to settle
-                        time.sleep(0.05)
-
-                except Exception:
-                    traceback.print_exc()
-                    time.sleep(0.2)
-        finally:
-            # Uninitialize COM if we initialized it earlier
-            if _HAS_PYTHONCOM:
-                try:
-                    pythoncom.CoUninitialize()
-                except Exception:
-                    pass
-            # Ensure engine ref cleared
-            self.engine = None
+        # NOTE: TTS worker logic has been moved to `ttswrapper.TTSWorker`.
+        # This stub remains to preserve compatibility but does nothing.
+        return
 
     def _stop_tts_worker(self):
         try:
-            self._tts_worker_stop.set()
-            # Wake the worker if blocked
-            try:
-                self._tts_queue.put(None, block=False)
-            except Exception:
-                pass
-            try:
-                self._tts_worker.join(timeout=2.0)
-            except Exception:
-                pass
+            if getattr(self, 'tts', None) is not None:
+                try:
+                    self.tts.stop()
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -740,6 +541,12 @@ class ToneReaderApp:
             self.stop_event.set()
             try:
                 self._stop_tts_worker()
+                # Stop watcher if present
+                try:
+                    if getattr(self, 'watcher', None) is not None:
+                        self.watcher.stop()
+                except Exception:
+                    pass
             except Exception:
                 pass
             self.root.destroy()
