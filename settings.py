@@ -3,11 +3,28 @@ import json
 
 
 def get_settings_path(base=None):
+    """Return a path to store the settings file.
+
+    Prefer a per-user location (%APPDATA% on Windows). If that is not
+    available, fall back to the package directory. Creates the directory
+    when needed.
+    """
     try:
         if base is None:
-            base = os.path.dirname(os.path.abspath(__file__))
+            # Prefer APPDATA on Windows for persistent per-user storage.
+            appdata = os.environ.get('APPDATA') or os.environ.get('XDG_CONFIG_HOME')
+            if appdata:
+                base = os.path.join(appdata, 'LSFD-Tone-Reader')
+                try:
+                    os.makedirs(base, exist_ok=True)
+                except Exception:
+                    # If we can't create the dir under APPDATA, fall back to package dir
+                    base = os.path.dirname(os.path.abspath(__file__))
+            else:
+                base = os.path.dirname(os.path.abspath(__file__))
     except Exception:
         base = os.getcwd()
+
     return os.path.join(base, 'tonereader_settings.json')
 
 
